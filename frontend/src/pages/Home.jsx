@@ -1,132 +1,286 @@
-import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom'; // Imported Link for routing
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import api from '../api';
 
 function Home() {
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  
+  const [error, setError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [sort, setSort] = useState('latest');
+  const [query, setQuery] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [onlyFollowing, setOnlyFollowing] = useState(false);
+  const [creatingPost, setCreatingPost] = useState(false);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
-  const [postError, setPostError] = useState('');
-  
-  const [showForm, setShowForm] = useState(false);
-  
-  const isLoggedIn = !!localStorage.getItem('access_token'); 
+  const [showComposer, setShowComposer] = useState(false);
+
+  const currentUserId = Number(localStorage.getItem('user_id') || 0);
+  const isLoggedIn = Boolean(localStorage.getItem('access_token'));
+
+  const loadFeed = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError('');
+      const response = await api.get('/feed', {
+        params: {
+          q: query || undefined,
+          sort,
+          only_following: onlyFollowing,
+          limit: 60,
+          skip: 0,
+        },
+      });
+      setPosts(response.data);
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to load feed.');
+      setPosts([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [onlyFollowing, query, sort]);
 
   useEffect(() => {
-    fetchPosts();
-  }, []);
+    loadFeed();
+  }, [loadFeed]);
 
-  const fetchPosts = async () => {
+  const handleSearchSubmit = (event) => {
+    event.preventDefault();
+    setQuery(searchInput.trim());
+  };
+
+  const handleCreatePost = async (event) => {
+    event.preventDefault();
+    const cleanTitle = title.trim();
+    const cleanContent = content.trim();
+    if (!cleanTitle || !cleanContent || creatingPost) return;
+
+    setCreatingPost(true);
+    setActionError('');
     try {
-      const response = await api.get('/posts/');
-      setPosts(response.data.reverse()); // Show newest posts first
-      setLoading(false);
+      await api.post('/posts/', { title: cleanTitle, content: cleanContent });
+      setTitle('');
+      setContent('');
+      setShowComposer(false);
+      await loadFeed();
     } catch (err) {
-      console.error("Error fetching posts:", err);
-      setError("Failed to load posts.");
-      setLoading(false);
+      setActionError(err.response?.data?.detail || 'Failed to create post.');
+    } finally {
+      setCreatingPost(false);
     }
   };
 
-  const handleCreatePost = async (e) => {
-    e.preventDefault();
-    setPostError('');
+  const toggleLike = async (post) => {
+    setActionError('');
+    const nextLiked = !post.is_liked;
+    setPosts((prev) => prev.map((row) => (
+      row.id === post.id
+        ? {
+          ...row,
+          is_liked: nextLiked,
+          like_count: Math.max(0, row.like_count + (nextLiked ? 1 : -1)),
+        }
+        : row
+    )));
 
     try {
-      await api.post('/posts/', { title, content });
-      setTitle('');   
-      setContent(''); 
-      setShowForm(false); 
-      fetchPosts();   
-    } catch (err) {
-      console.error("Failed to create post:", err);
-      setPostError(err.response?.data?.detail || "Failed to create post. Are you logged in?");
+      if (nextLiked) {
+        await api.post(`/posts/${post.id}/reactions`, { reaction_type: 'like' });
+      } else {
+        await api.delete(`/posts/${post.id}/reactions`);
+      }
+    } catch {
+      setPosts((prev) => prev.map((row) => (row.id === post.id ? post : row)));
+      setActionError('Failed to update reaction.');
     }
   };
 
-  if (loading) return <div style={{ textAlign: 'center', marginTop: '50px' }}>Loading posts...</div>;
-  if (error) return <div style={{ color: 'red', textAlign: 'center', marginTop: '50px' }}>{error}</div>;
+  const toggleBookmark = async (post) => {
+    setActionError('');
+    const nextBookmarked = !post.is_bookmarked;
+    setPosts((prev) => prev.map((row) => (
+      row.id === post.id ? { ...row, is_bookmarked: nextBookmarked } : row
+    )));
+    try {
+      if (nextBookmarked) {
+        await api.post(`/posts/${post.id}/bookmark`);
+      } else {
+        await api.delete(`/posts/${post.id}/bookmark`);
+      }
+    } catch {
+      setPosts((prev) => prev.map((row) => (row.id === post.id ? post : row)));
+      setActionError('Failed to update bookmark.');
+    }
+  };
+
+  const toggleFollow = async (post) => {
+    if (post.author_id === currentUserId) return;
+    setActionError('');
+    const nextFollowing = !post.is_following_author;
+    setPosts((prev) => prev.map((row) => (
+      row.author_id === post.author_id ? { ...row, is_following_author: nextFollowing } : row
+    )));
+    try {
+      if (nextFollowing) {
+        await api.post(`/users/${post.author_id}/follow`);
+      } else {
+        await api.delete(`/users/${post.author_id}/follow`);
+      }
+    } catch {
+      setPosts((prev) => prev.map((row) => (
+        row.author_id === post.author_id ? { ...row, is_following_author: post.is_following_author } : row
+      )));
+      setActionError('Failed to update follow status.');
+    }
+  };
+
+  const reportPost = async (postId) => {
+    const reason = window.prompt('Report reason (min 5 characters):');
+    if (!reason) return;
+    try {
+      await api.post('/reports', { target_type: 'post', target_id: postId, reason });
+      window.alert('Report submitted.');
+    } catch (err) {
+      window.alert(err.response?.data?.detail || 'Failed to submit report.');
+    }
+  };
+
+  const emptyMessage = useMemo(() => {
+    if (loading) return 'Loading feed...';
+    if (error) return error;
+    return 'No posts matched your filters.';
+  }, [error, loading]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '0 20px' }}>
-      <div style={{ width: '100%', maxWidth: '600px' }}>
-        <h1 style={{ textAlign: 'center', marginBottom: '30px', color: '#333' }}>Community Feed</h1>
-        
-        {/* --- TOGGLE CREATE POST BUTTON --- */}
-        {isLoggedIn && (
-          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '20px' }}>
-            <button 
-              onClick={() => setShowForm(!showForm)}
-              style={{ padding: '10px 20px', backgroundColor: showForm ? '#6c757d' : '#007BFF', color: 'white', border: 'none', borderRadius: '20px', cursor: 'pointer', fontWeight: 'bold', transition: '0.2s' }}
+    <section className="page page-feed">
+      <div className="page-header">
+        <h1>Community Feed</h1>
+        <p>Discover stories, react to ideas, and follow authors you care about.</p>
+      </div>
+
+      <div className="feed-container">
+        <article className="card feed-toolbar">
+          <form className="feed-search-row" onSubmit={handleSearchSubmit}>
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              placeholder="Search posts by title or content"
+            />
+            <button type="submit" className="btn btn-primary">Search</button>
+          </form>
+
+          <div className="feed-filter-row">
+            <label className="feed-select-wrap">
+              <span>Sort</span>
+              <select value={sort} onChange={(event) => setSort(event.target.value)}>
+                <option value="latest">Latest</option>
+                <option value="most_liked">Most Liked</option>
+                <option value="most_commented">Most Commented</option>
+              </select>
+            </label>
+
+            <label className="feed-toggle-wrap">
+              <input
+                type="checkbox"
+                checked={onlyFollowing}
+                onChange={(event) => setOnlyFollowing(event.target.checked)}
+              />
+              <span>Only people I follow</span>
+            </label>
+
+            <button
+              type="button"
+              className="btn btn-muted"
+              onClick={() => {
+                setSearchInput('');
+                setQuery('');
+                setSort('latest');
+                setOnlyFollowing(false);
+              }}
             >
-              {showForm ? 'Cancel' : '+ Create New Post'}
+              Reset
+            </button>
+          </div>
+        </article>
+
+        {isLoggedIn && (
+          <div className="feed-actions">
+            <button type="button" onClick={() => setShowComposer((prev) => !prev)} className="btn btn-accent">
+              {showComposer ? 'Cancel' : '+ Create New Post'}
             </button>
           </div>
         )}
 
-        {/* --- CREATE POST FORM --- */}
-        {showForm && isLoggedIn && (
-          <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '8px', boxShadow: '0 2px 8px rgba(0,0,0,0.1)', marginBottom: '40px' }}>
-            <h3 style={{ marginTop: '0', marginBottom: '15px' }}>Share your views</h3>
-            {postError && <div style={{ color: 'red', marginBottom: '10px' }}>{postError}</div>}
-            
-            <form onSubmit={handleCreatePost} style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-              <input 
-                type="text" 
-                placeholder="Post Title" 
-                value={title} 
-                onChange={(e) => setTitle(e.target.value)} 
-                required 
-                style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', width: '100%', boxSizing: 'border-box' }}
+        {showComposer && (
+          <article className="card create-post-card">
+            <h3>Share your perspective</h3>
+            <form onSubmit={handleCreatePost} className="form-stack">
+              <input
+                type="text"
+                placeholder="Post title"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                required
               />
-              <textarea 
-                placeholder="What's on your mind?" 
-                value={content} 
-                onChange={(e) => setContent(e.target.value)} 
-                required 
-                rows="3"
-                style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', width: '100%', boxSizing: 'border-box', resize: 'vertical' }}
+              <textarea
+                placeholder="What are you thinking about today?"
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                required
+                rows="5"
               />
-              <button 
-                type="submit" 
-                style={{ padding: '10px 20px', backgroundColor: '#28a745', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', alignSelf: 'flex-end' }}
-              >
-                Post
+              <button type="submit" className="btn btn-accent" disabled={creatingPost}>
+                {creatingPost ? 'Publishing...' : 'Publish'}
               </button>
             </form>
-          </div>
+          </article>
         )}
 
-        {/* --- BLOG FEED --- */}
+        {actionError && <div className="form-error">{actionError}</div>}
+
         {posts.length === 0 ? (
-          <p style={{ textAlign: 'center', color: '#666' }}>No posts yet. Be the first to share!</p>
+          <p className={`status-text ${error ? 'status-error' : ''}`}>{emptyMessage}</p>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div className="feed-list">
             {posts.map((post) => (
-              <div key={post.id} style={{ padding: '20px', borderRadius: '8px', backgroundColor: '#ffffff', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-                
-                {/* Clickable Title linked to the specific Post view */}
-                <Link to={`/post/${post.id}`} style={{ textDecoration: 'none' }}>
-                  <h2 style={{ marginTop: '0', marginBottom: '10px', color: '#007BFF' }}>
-                    {post.title}
-                  </h2>
+              <article key={post.id} className="card post-card">
+                <Link to={`/post/${post.id}`} className="post-title-link">
+                  <h2>{post.title}</h2>
                 </Link>
-                
-                <p style={{ color: '#444', lineHeight: '1.6', whiteSpace: 'pre-wrap', margin: 0 }}>{post.content}</p>
-                <div style={{ fontSize: '0.85em', color: '#888', marginTop: '20px', display: 'flex', justifyContent: 'space-between', borderTop: '1px solid #eee', paddingTop: '10px' }}>
-                  {/* Change this line to use post.author.username */}
-                  <span style={{ fontWeight: 'bold' }}>Posted by: {post.author?.username}</span>
-                  <span>{new Date(post.created_at).toLocaleDateString()}</span>
+                <p className="post-snippet">{post.content}</p>
+                <div className="post-meta">
+                  <span>By {post.author?.username || 'Unknown'}</span>
+                  <span>{new Date(post.created_at).toLocaleString()}</span>
                 </div>
-              </div>
+
+                <div className="post-engagement-row">
+                  <button type="button" className="btn btn-muted" onClick={() => toggleLike(post)}>
+                    {post.is_liked ? 'Unlike' : 'Like'} ({post.like_count})
+                  </button>
+                  <button type="button" className="btn btn-muted" onClick={() => toggleBookmark(post)}>
+                    {post.is_bookmarked ? 'Saved' : 'Save'}
+                  </button>
+                  {post.author_id !== currentUserId && (
+                    <button type="button" className="btn btn-muted" onClick={() => toggleFollow(post)}>
+                      {post.is_following_author ? 'Following' : 'Follow'}
+                    </button>
+                  )}
+                  <button type="button" className="btn btn-muted" onClick={() => reportPost(post.id)}>
+                    Report
+                  </button>
+                </div>
+
+                <div className="post-submeta">
+                  <span>{post.comment_count} comments</span>
+                </div>
+              </article>
             ))}
           </div>
         )}
       </div>
-    </div>
+    </section>
   );
 }
 

@@ -1,6 +1,5 @@
-body {
-  margin: 0;
-  font-family: Arial, sans-serif;
-  background-color: #f4f6f8; /* A nice, soft gray background */
-  color: #333;
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }

@@ -1,12 +1,11 @@
 import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom'; // Added Link
-import api from '../api';
+import { Link } from 'react-router-dom';
+import api, { setSessionData } from '../api';
 
 function Login() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -19,72 +18,185 @@ function Login() {
     try {
       const response = await api.post('/login', formData, {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        skipAuthRefresh: true,
       });
-      
-      // Store all user data
-      localStorage.setItem('access_token', response.data.access_token);
-      localStorage.setItem('username', response.data.username); 
-      localStorage.setItem('user_id', response.data.user_id); 
-      
-      // Force reload to update Navbar state
-      window.location.href = '/'; 
-      
+
+      setSessionData({
+        accessToken: response.data.access_token,
+        refreshToken: response.data.refresh_token,
+        username: response.data.username,
+        userId: response.data.user_id,
+      });
+
+      window.location.href = '/';
     } catch (err) {
-      console.error("Login failed:", err);
+      console.error('Login failed:', err);
       setError(err.response?.data?.detail || 'Login failed. Please check your credentials.');
     }
   };
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 'calc(100vh - 100px)' }}>
-      
-      <div style={{ width: '100%', maxWidth: '400px', padding: '30px', border: '1px solid #e0e0e0', borderRadius: '12px', backgroundColor: '#ffffff', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}>
-        <h2 style={{ textAlign: 'center', marginTop: '0', color: '#333' }}>Welcome Back</h2>
-        
-        {error && (
-          <div style={{ color: 'red', marginBottom: '15px', textAlign: 'center', backgroundColor: '#ffe6e6', padding: '10px', borderRadius: '4px' }}>
-            {error}
-          </div>
-        )}
-        
-        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          <div>
-            <label style={{ fontWeight: '600', color: '#555' }}>Username or Email</label>
-            <input 
-              type="text" 
-              value={username} 
-              onChange={(e) => setUsername(e.target.value)} 
-              required 
-              style={{ width: '100%', padding: '12px', marginTop: '8px', boxSizing: 'border-box', borderRadius: '6px', border: '1px solid #ccc' }}
+    <section style={styles.wrapper}>
+      <div style={styles.card}>
+        <h2 style={styles.title}>Welcome back</h2>
+        <p style={styles.subtitle}>Log in to continue writing, commenting, and connecting.</p>
+
+        {error && <div style={styles.errorBox}>{error}</div>}
+
+        <form onSubmit={handleSubmit}>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Username or Email</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+              style={styles.input}
+              placeholder="Enter your username"
+              onFocus={(e) => {
+                e.target.style.borderColor = '#ff4f8a';
+                e.target.style.boxShadow = '0 0 0 4px rgba(255, 79, 138, 0.18)';
+              }}
+              onBlur={(e) => {
+                e.target.style.borderColor = '#f8bfd2';
+                e.target.style.boxShadow = 'none';
+              }}
             />
           </div>
-          
-          <div>
-            <label style={{ fontWeight: '600', color: '#555' }}>Password</label>
-            <input 
-              type="password" 
-              value={password} 
-              onChange={(e) => setPassword(e.target.value)} 
-              required 
-              style={{ width: '100%', padding: '12px', marginTop: '8px', boxSizing: 'border-box', borderRadius: '6px', border: '1px solid #ccc' }}
+
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              style={styles.input}
+              placeholder="********"
+              onFocus={(e) => {
+                e.target.style.borderColor = '#ff4f8a';
+                e.target.style.boxShadow = '0 0 0 4px rgba(255, 79, 138, 0.18)';
+              }}
+              onBlur={(e) => {
+                e.target.style.borderColor = '#f8bfd2';
+                e.target.style.boxShadow = 'none';
+              }}
             />
           </div>
-          
-          <button 
-            type="submit" 
-            style={{ padding: '14px', cursor: 'pointer', backgroundColor: '#007BFF', color: 'white', border: 'none', borderRadius: '6px', fontSize: '16px', fontWeight: 'bold', marginTop: '10px', transition: 'background-color 0.2s' }}
+
+          <button
+            type="submit"
+            className="btn btn-accent btn-login-hero"
+            style={styles.button}
           >
             Login
           </button>
         </form>
 
-        {/* Link to Signup Page */}
-        <p style={{ textAlign: 'center', marginTop: '20px', color: '#666' }}>
-          Don't have an account? <Link to="/signup" style={{ color: '#007BFF', textDecoration: 'none', fontWeight: 'bold' }}>Sign Up</Link>
+        <p style={styles.footerText}>
+          Don&apos;t have an account?
+          <Link to="/signup" style={styles.link}>Sign up</Link>
         </p>
       </div>
-    </div>
+    </section>
   );
 }
+
+const styles = {
+  wrapper: {
+    minHeight: 'calc(100vh - 150px)',
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '24px 16px',
+    boxSizing: 'border-box',
+  },
+  card: {
+    backgroundColor: '#ffffff',
+    width: '100%',
+    maxWidth: '460px',
+    padding: '40px 34px',
+    borderRadius: '24px',
+    boxShadow: '0 18px 30px rgba(255, 91, 145, 0.22)',
+    boxSizing: 'border-box',
+    border: '2px solid #ffb8d3',
+  },
+  title: {
+    margin: '0 0 10px 0',
+    fontSize: '34px',
+    fontWeight: '800',
+    color: '#12203a',
+    textAlign: 'center',
+    letterSpacing: '-0.5px',
+  },
+  subtitle: {
+    margin: '0 0 30px 0',
+    fontSize: '15px',
+    color: '#5f4b58',
+    lineHeight: '1.6',
+    textAlign: 'center',
+    fontWeight: '600',
+  },
+  errorBox: {
+    backgroundColor: '#ffe2e7',
+    color: '#b1153d',
+    padding: '11px 14px',
+    borderRadius: '12px',
+    fontSize: '14px',
+    fontWeight: '600',
+    marginBottom: '20px',
+    border: '1px solid #ff8bb0',
+    textAlign: 'center',
+  },
+  formGroup: {
+    marginBottom: '18px',
+  },
+  label: {
+    display: 'block',
+    fontSize: '14px',
+    fontWeight: '700',
+    color: '#2e3550',
+    marginBottom: '8px',
+  },
+  input: {
+    width: '100%',
+    padding: '13px 14px',
+    fontSize: '15px',
+    color: '#1d2333',
+    backgroundColor: '#fffdf7',
+    border: '2px solid #f8bfd2',
+    borderRadius: '12px',
+    boxSizing: 'border-box',
+    outline: 'none',
+    transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
+  },
+  button: {
+    width: '100%',
+    padding: '15px',
+    marginTop: '6px',
+    fontSize: '16px',
+    fontWeight: '800',
+    color: '#ffffff',
+    border: 'none',
+    borderRadius: '12px',
+    cursor: 'pointer',
+    transition: 'all 0.2s ease',
+    boxShadow: '0 10px 18px rgba(255, 79, 138, 0.35)',
+  },
+  footerText: {
+    marginTop: '24px',
+    textAlign: 'center',
+    fontSize: '15px',
+    color: '#5f4b58',
+    fontWeight: '600',
+  },
+  link: {
+    color: '#cb1364',
+    fontWeight: '800',
+    textDecoration: 'none',
+    marginLeft: '6px',
+  },
+};
 
 export default Login;
