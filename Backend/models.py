@@ -53,6 +53,7 @@ class Post(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    image_url = Column(String, default="")
     author_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=utcnow)
 
@@ -105,6 +106,20 @@ class Follow(Base):
     follower_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     following_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=utcnow)
+
+
+class ChatRequest(Base):
+    __tablename__ = "chat_requests"
+    __table_args__ = (UniqueConstraint("pair_low_id", "pair_high_id", name="uq_chat_request_pair"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    target_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    pair_low_id = Column(Integer, nullable=False, index=True)
+    pair_high_id = Column(Integer, nullable=False, index=True)
+    status = Column(String, default="pending", nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Bookmark(Base):
@@ -176,4 +191,17 @@ class RefreshToken(Base):
     token_hash = Column(String, unique=True, index=True, nullable=False)
     expires_at = Column(DateTime, nullable=False)
     revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class PasswordResetOTP(Base):
+    __tablename__ = "password_reset_otps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    email = Column(String, nullable=False, index=True)
+    otp_hash = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)

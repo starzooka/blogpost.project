@@ -1,14 +1,21 @@
-import { useEffect, useState } from 'react';
-import api from '../api';
+import { useEffect, useRef, useState } from 'react';
+import api, { setSessionData } from '../api';
 
 function Profile() {
   const [profile, setProfile] = useState(null);
   const [bio, setBio] = useState('');
   const [location, setLocation] = useState('');
   const [avatarUrl, setAvatarUrl] = useState('');
+  const [avatarUploading, setAvatarUploading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const avatarInputRef = useRef(null);
+
+  const syncSessionAvatar = (nextAvatarUrl) => {
+    setSessionData({ avatarUrl: nextAvatarUrl || '' });
+    window.dispatchEvent(new Event('session-updated'));
+  };
 
   useEffect(() => {
     const fetchProfile = async () => {
@@ -18,6 +25,7 @@ function Profile() {
         setBio(response.data.bio || '');
         setLocation(response.data.location || '');
         setAvatarUrl(response.data.avatar_url || '');
+        syncSessionAvatar(response.data.avatar_url || '');
       } catch (err) {
         setError(err.response?.data?.detail || 'Failed to load profile.');
       } finally {
@@ -34,9 +42,38 @@ function Profile() {
     try {
       const response = await api.put('/me/profile', { bio, location, avatar_url: avatarUrl });
       setProfile(response.data);
+      setAvatarUrl(response.data.avatar_url || '');
+      syncSessionAvatar(response.data.avatar_url || '');
       setStatus('Profile updated successfully.');
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to update profile.');
+    }
+  };
+
+  const handleAvatarUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    setAvatarUploading(true);
+    setStatus('');
+    setError('');
+    try {
+      const response = await api.put('/users/profile/avatar', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const nextAvatarUrl = response.data?.avatar_url || '';
+      setAvatarUrl(nextAvatarUrl);
+      setProfile((prev) => (prev ? { ...prev, avatar_url: nextAvatarUrl } : prev));
+      syncSessionAvatar(nextAvatarUrl);
+      setStatus('Profile picture updated successfully.');
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to update profile picture.');
+    } finally {
+      setAvatarUploading(false);
+      event.target.value = '';
     }
   };
 
@@ -64,6 +101,21 @@ function Profile() {
           ) : (
             <div className="profile-avatar">{initial}</div>
           )}
+          <input
+            ref={avatarInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleAvatarUpload}
+            className="profile-avatar-input"
+          />
+          <button
+            type="button"
+            className="btn btn-muted profile-avatar-button"
+            onClick={() => avatarInputRef.current?.click()}
+            disabled={avatarUploading}
+          >
+            {avatarUploading ? 'Uploading...' : 'Change Profile Picture'}
+          </button>
           <h3>{profile?.username}</h3>
           <div className="info-row">
             <span>Email</span>
@@ -92,7 +144,7 @@ function Profile() {
             </div>
 
             <div>
-              <label>Avatar URL</label>
+              <label>Avatar URL (optional)</label>
               <input
                 type="url"
                 value={avatarUrl}

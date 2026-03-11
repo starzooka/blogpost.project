@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
+import ImageLightbox from '../components/ImageLightbox';
 
 function Home() {
   const [posts, setPosts] = useState([]);
@@ -12,11 +13,13 @@ function Home() {
   const [searchInput, setSearchInput] = useState('');
   const [onlyFollowing, setOnlyFollowing] = useState(false);
   const [creatingPost, setCreatingPost] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
+  const [imageUrl, setImageUrl] = useState('');
   const [showComposer, setShowComposer] = useState(false);
+  const [fullscreenImage, setFullscreenImage] = useState('');
 
-  const currentUserId = Number(localStorage.getItem('user_id') || 0);
   const isLoggedIn = Boolean(localStorage.getItem('access_token'));
 
   const loadFeed = useCallback(async () => {
@@ -45,6 +48,27 @@ function Home() {
     loadFeed();
   }, [loadFeed]);
 
+  const handleImageUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    setUploadingImage(true);
+    setActionError('');
+    try {
+      const response = await api.post('/upload-image/', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setImageUrl(response.data.image_url);
+    } catch {
+      setActionError('Failed to upload image.');
+    } finally {
+      setUploadingImage(false);
+    }
+  };
+
   const handleSearchSubmit = (event) => {
     event.preventDefault();
     setQuery(searchInput.trim());
@@ -54,14 +78,19 @@ function Home() {
     event.preventDefault();
     const cleanTitle = title.trim();
     const cleanContent = content.trim();
+    if (uploadingImage) {
+      setActionError('Please wait for image upload to finish.');
+      return;
+    }
     if (!cleanTitle || !cleanContent || creatingPost) return;
 
     setCreatingPost(true);
     setActionError('');
     try {
-      await api.post('/posts/', { title: cleanTitle, content: cleanContent });
+      await api.post('/posts/', { title: cleanTitle, content: cleanContent, image_url: imageUrl });
       setTitle('');
       setContent('');
+      setImageUrl('');
       setShowComposer(false);
       await loadFeed();
     } catch (err) {
@@ -71,215 +100,230 @@ function Home() {
     }
   };
 
-  const toggleLike = async (post) => {
-    setActionError('');
-    const nextLiked = !post.is_liked;
-    setPosts((prev) => prev.map((row) => (
-      row.id === post.id
-        ? {
-          ...row,
-          is_liked: nextLiked,
-          like_count: Math.max(0, row.like_count + (nextLiked ? 1 : -1)),
-        }
-        : row
-    )));
-
-    try {
-      if (nextLiked) {
-        await api.post(`/posts/${post.id}/reactions`, { reaction_type: 'like' });
-      } else {
-        await api.delete(`/posts/${post.id}/reactions`);
-      }
-    } catch {
-      setPosts((prev) => prev.map((row) => (row.id === post.id ? post : row)));
-      setActionError('Failed to update reaction.');
-    }
-  };
-
-  const toggleBookmark = async (post) => {
-    setActionError('');
-    const nextBookmarked = !post.is_bookmarked;
-    setPosts((prev) => prev.map((row) => (
-      row.id === post.id ? { ...row, is_bookmarked: nextBookmarked } : row
-    )));
-    try {
-      if (nextBookmarked) {
-        await api.post(`/posts/${post.id}/bookmark`);
-      } else {
-        await api.delete(`/posts/${post.id}/bookmark`);
-      }
-    } catch {
-      setPosts((prev) => prev.map((row) => (row.id === post.id ? post : row)));
-      setActionError('Failed to update bookmark.');
-    }
-  };
-
-  const toggleFollow = async (post) => {
-    if (post.author_id === currentUserId) return;
-    setActionError('');
-    const nextFollowing = !post.is_following_author;
-    setPosts((prev) => prev.map((row) => (
-      row.author_id === post.author_id ? { ...row, is_following_author: nextFollowing } : row
-    )));
-    try {
-      if (nextFollowing) {
-        await api.post(`/users/${post.author_id}/follow`);
-      } else {
-        await api.delete(`/users/${post.author_id}/follow`);
-      }
-    } catch {
-      setPosts((prev) => prev.map((row) => (
-        row.author_id === post.author_id ? { ...row, is_following_author: post.is_following_author } : row
-      )));
-      setActionError('Failed to update follow status.');
-    }
-  };
-
-  const reportPost = async (postId) => {
-    const reason = window.prompt('Report reason (min 5 characters):');
-    if (!reason) return;
-    try {
-      await api.post('/reports', { target_type: 'post', target_id: postId, reason });
-      window.alert('Report submitted.');
-    } catch (err) {
-      window.alert(err.response?.data?.detail || 'Failed to submit report.');
-    }
-  };
-
   const emptyMessage = useMemo(() => {
     if (loading) return 'Loading feed...';
     if (error) return error;
     return 'No posts matched your filters.';
   }, [error, loading]);
 
-  return (
-    <section className="page page-feed">
-      <div className="page-header">
-        <h1>Community Feed</h1>
-        <p>Discover stories, react to ideas, and follow authors you care about.</p>
-      </div>
+  const featuredSlots = useMemo(() => {
+    const rows = posts.slice(0, 6);
+    while (rows.length < 6) rows.push(null);
+    return rows;
+  }, [posts]);
 
-      <div className="feed-container">
-        <article className="card feed-toolbar">
-          <form className="feed-search-row" onSubmit={handleSearchSubmit}>
+  const latestPosts = useMemo(() => posts.slice(6), [posts]);
+
+  const getPostTag = (post) => {
+    if (post.like_count >= 10) return 'Engineering';
+    if (post.comment_count >= 5) return 'Design';
+    if (post.is_bookmarked) return 'Product';
+    return 'Company';
+  };
+
+  const formatDate = (value) => {
+    try {
+      return new Date(value).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+    } catch {
+      return '';
+    }
+  };
+
+  const authorInitial = (username) => {
+    if (!username) return 'U';
+    return username.charAt(0).toUpperCase();
+  };
+
+  const renderAuthor = (post) => (
+    <div className="home-blog-author-row">
+      <div className="home-blog-author-left">
+        {post.author?.avatar_url ? (
+          <img src={post.author.avatar_url} alt={post.author?.username || 'Author'} className="home-blog-avatar" />
+        ) : (
+          <span className="home-blog-avatar home-blog-avatar-fallback">{authorInitial(post.author?.username)}</span>
+        )}
+        <span className="home-blog-author-name">{post.author?.username || 'Unknown'}</span>
+      </div>
+      <span className="home-blog-date">{formatDate(post.created_at)}</span>
+    </div>
+  );
+
+  const renderFeatureCard = (post, variant) => {
+    if (!post) {
+      return <div className={`home-blog-card home-blog-card-empty ${variant}`} key={`${variant}-empty`} />;
+    }
+
+    const textOnly = variant === 'stacked';
+    return (
+      <article key={post.id} className={`home-blog-card ${variant}`}>
+        {!textOnly && post.image_url && (
+          <button
+            type="button"
+            className="home-blog-image-button"
+            onClick={() => setFullscreenImage(post.image_url)}
+            aria-label="Open image in full screen"
+          >
+            <img src={post.image_url} alt={post.title} className="home-blog-image" />
+          </button>
+        )}
+        <div className="home-blog-card-content">
+          <span className="home-blog-tag">{getPostTag(post)}</span>
+          <Link to={`/post/${post.id}`} className="home-blog-title-link">
+            <h3>{post.title}</h3>
+          </Link>
+          <p className="home-blog-snippet">{post.content}</p>
+          {renderAuthor(post)}
+        </div>
+      </article>
+    );
+  };
+
+  return (
+    <section className="home-blog-shell">
+      <header className="home-blog-hero">
+        <div>
+          <h1>Blog</h1>
+          <p>Stay in the loop with the latest stories from your community.</p>
+        </div>
+        {isLoggedIn && (
+          <button type="button" onClick={() => setShowComposer((prev) => !prev)} className="btn home-blog-create-btn">
+            {showComposer ? 'Close editor' : '+ Create New Post'}
+          </button>
+        )}
+      </header>
+
+      <article className="home-blog-toolbar">
+        <div className="home-blog-chip-row">
+          <button
+            type="button"
+            className={`home-blog-chip${sort === 'latest' ? ' is-active' : ''}`}
+            onClick={() => setSort('latest')}
+          >
+            All categories
+          </button>
+          <button
+            type="button"
+            className={`home-blog-chip${sort === 'most_liked' ? ' is-active' : ''}`}
+            onClick={() => setSort('most_liked')}
+          >
+            Product
+          </button>
+          <button
+            type="button"
+            className={`home-blog-chip${sort === 'most_commented' ? ' is-active' : ''}`}
+            onClick={() => setSort('most_commented')}
+          >
+            Design
+          </button>
+          <button
+            type="button"
+            className={`home-blog-chip${onlyFollowing ? ' is-active' : ''}`}
+            onClick={() => setOnlyFollowing((prev) => !prev)}
+          >
+            Following
+          </button>
+        </div>
+
+        <form className="home-blog-search-row" onSubmit={handleSearchSubmit}>
+          <input
+            type="text"
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="Search..."
+          />
+          <button type="submit" className="btn home-blog-btn-main">Search</button>
+          <button
+            type="button"
+            className="btn home-blog-btn-subtle"
+            onClick={() => {
+              setSearchInput('');
+              setQuery('');
+              setSort('latest');
+              setOnlyFollowing(false);
+            }}
+          >
+            Reset
+          </button>
+        </form>
+      </article>
+
+      {showComposer && (
+        <article className="home-blog-composer">
+          <h3>Share your perspective</h3>
+          <form onSubmit={handleCreatePost} className="form-stack">
             <input
               type="text"
-              value={searchInput}
-              onChange={(event) => setSearchInput(event.target.value)}
-              placeholder="Search posts by title or content"
+              placeholder="Post title"
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              required
             />
-            <button type="submit" className="btn btn-primary">Search</button>
+            <textarea
+              placeholder="What are you thinking about today?"
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              required
+              rows="5"
+            />
+            <input
+              type="file"
+              accept="image/*"
+              onChange={handleImageUpload}
+            />
+            {imageUrl && <p className="home-blog-upload-note">Image uploaded and ready to publish.</p>}
+            <button type="submit" className="btn home-blog-btn-main" disabled={creatingPost || uploadingImage}>
+              {creatingPost ? 'Publishing...' : uploadingImage ? 'Uploading image...' : 'Publish'}
+            </button>
           </form>
-
-          <div className="feed-filter-row">
-            <label className="feed-select-wrap">
-              <span>Sort</span>
-              <select value={sort} onChange={(event) => setSort(event.target.value)}>
-                <option value="latest">Latest</option>
-                <option value="most_liked">Most Liked</option>
-                <option value="most_commented">Most Commented</option>
-              </select>
-            </label>
-
-            <label className="feed-toggle-wrap">
-              <input
-                type="checkbox"
-                checked={onlyFollowing}
-                onChange={(event) => setOnlyFollowing(event.target.checked)}
-              />
-              <span>Only people I follow</span>
-            </label>
-
-            <button
-              type="button"
-              className="btn btn-muted"
-              onClick={() => {
-                setSearchInput('');
-                setQuery('');
-                setSort('latest');
-                setOnlyFollowing(false);
-              }}
-            >
-              Reset
-            </button>
-          </div>
         </article>
+      )}
 
-        {isLoggedIn && (
-          <div className="feed-actions">
-            <button type="button" onClick={() => setShowComposer((prev) => !prev)} className="btn btn-accent">
-              {showComposer ? 'Cancel' : '+ Create New Post'}
-            </button>
-          </div>
-        )}
+      {actionError && <div className="form-error">{actionError}</div>}
 
-        {showComposer && (
-          <article className="card create-post-card">
-            <h3>Share your perspective</h3>
-            <form onSubmit={handleCreatePost} className="form-stack">
-              <input
-                type="text"
-                placeholder="Post title"
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                required
-              />
-              <textarea
-                placeholder="What are you thinking about today?"
-                value={content}
-                onChange={(event) => setContent(event.target.value)}
-                required
-                rows="5"
-              />
-              <button type="submit" className="btn btn-accent" disabled={creatingPost}>
-                {creatingPost ? 'Publishing...' : 'Publish'}
-              </button>
-            </form>
-          </article>
-        )}
+      {posts.length === 0 ? (
+        <p className={`status-text ${error ? 'status-error' : ''}`}>{emptyMessage}</p>
+      ) : (
+        <>
+          <section className="home-blog-section">
+            <div className="home-blog-feature-grid">
+              {renderFeatureCard(featuredSlots[0], 'hero')}
+              {renderFeatureCard(featuredSlots[1], 'hero')}
+              {renderFeatureCard(featuredSlots[2], 'column')}
+              <div className="home-blog-stack-col">
+                {renderFeatureCard(featuredSlots[3], 'stacked')}
+                {renderFeatureCard(featuredSlots[4], 'stacked')}
+              </div>
+              {renderFeatureCard(featuredSlots[5], 'column')}
+            </div>
+          </section>
 
-        {actionError && <div className="form-error">{actionError}</div>}
+          {latestPosts.length > 0 && (
+            <section className="home-blog-section">
+              <div className="home-blog-latest-head">
+                <h2>Latest</h2>
+              </div>
+              <div className="home-blog-latest-grid">
+                {latestPosts.map((post) => (
+                  <article key={post.id} className="home-blog-latest-item">
+                    <span className="home-blog-tag">{getPostTag(post)}</span>
+                    <Link to={`/post/${post.id}`} className="home-blog-latest-title-link">
+                      <h3>{post.title}</h3>
+                    </Link>
+                    <p>{post.content}</p>
+                    {renderAuthor(post)}
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+        </>
+      )}
 
-        {posts.length === 0 ? (
-          <p className={`status-text ${error ? 'status-error' : ''}`}>{emptyMessage}</p>
-        ) : (
-          <div className="feed-list">
-            {posts.map((post) => (
-              <article key={post.id} className="card post-card">
-                <Link to={`/post/${post.id}`} className="post-title-link">
-                  <h2>{post.title}</h2>
-                </Link>
-                <p className="post-snippet">{post.content}</p>
-                <div className="post-meta">
-                  <span>By {post.author?.username || 'Unknown'}</span>
-                  <span>{new Date(post.created_at).toLocaleString()}</span>
-                </div>
-
-                <div className="post-engagement-row">
-                  <button type="button" className="btn btn-muted" onClick={() => toggleLike(post)}>
-                    {post.is_liked ? 'Unlike' : 'Like'} ({post.like_count})
-                  </button>
-                  <button type="button" className="btn btn-muted" onClick={() => toggleBookmark(post)}>
-                    {post.is_bookmarked ? 'Saved' : 'Save'}
-                  </button>
-                  {post.author_id !== currentUserId && (
-                    <button type="button" className="btn btn-muted" onClick={() => toggleFollow(post)}>
-                      {post.is_following_author ? 'Following' : 'Follow'}
-                    </button>
-                  )}
-                  <button type="button" className="btn btn-muted" onClick={() => reportPost(post.id)}>
-                    Report
-                  </button>
-                </div>
-
-                <div className="post-submeta">
-                  <span>{post.comment_count} comments</span>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
+      <ImageLightbox imageUrl={fullscreenImage} onClose={() => setFullscreenImage('')} />
     </section>
   );
 }

@@ -1,16 +1,32 @@
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
+import hashlib
+import hmac
 import json
+import os
+import random
+import urllib.error
+import urllib.request
 
-from fastapi import FastAPI, Depends, HTTPException, status, Response, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Response, WebSocket, WebSocketDisconnect, Request, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, func
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import or_, and_, func, inspect, text
 
 from Backend import models, schemas, database, utils, oauth2
 from .manager import manager
+
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
 
 app = FastAPI(title='Community Blog API')
 
@@ -22,14 +38,40 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
+app.mount("/static", StaticFiles(directory="Backend/static"), name="static")
+
 LOGIN_WINDOW_SECONDS = 60
 MAX_LOGIN_ATTEMPTS = 12
+PASSWORD_RESET_OTP_TTL_MINUTES = 10
+PASSWORD_RESET_MAX_ATTEMPTS = 5
 _login_attempts: dict[str, list[float]] = defaultdict(list)
+
+
+def _ensure_post_image_url_column() -> None:
+    """Backfill legacy databases that predate the image_url column."""
+    inspector = inspect(database.engine)
+    if 'posts' not in inspector.get_table_names():
+        return
+
+    columns = {column['name'] for column in inspector.get_columns('posts')}
+    if 'image_url' in columns:
+        return
+
+    with database.engine.begin() as conn:
+        conn.execute(text("ALTER TABLE posts ADD COLUMN image_url VARCHAR DEFAULT ''"))
+        conn.execute(text("UPDATE posts SET image_url = '' WHERE image_url IS NULL"))
 
 
 @app.on_event('startup')
 def startup() -> None:
     database.Base.metadata.create_all(bind=database.engine)
+    _ensure_post_image_url_column()
+
+
+@app.post("/upload-image/")
+async def upload_image(file: UploadFile = File(...)):
+    result = cloudinary.uploader.upload(file.file)
+    return {"image_url": result['secure_url']}
 
 
 @app.get('/')
@@ -46,6 +88,71 @@ def _require_admin(user: models.User):
         raise HTTPException(status_code=403, detail='Admin access required')
 
 
+def _pair_ids(user_a_id: int, user_b_id: int) -> tuple[int, int]:
+    return (user_a_id, user_b_id) if user_a_id < user_b_id else (user_b_id, user_a_id)
+
+
+def _chat_request_between(db: Session, user_a_id: int, user_b_id: int) -> Optional[models.ChatRequest]:
+    low, high = _pair_ids(user_a_id, user_b_id)
+    return db.query(models.ChatRequest).filter(
+        models.ChatRequest.pair_low_id == low,
+        models.ChatRequest.pair_high_id == high,
+    ).first()
+
+
+def _is_mutual_follow(db: Session, user_a_id: int, user_b_id: int) -> bool:
+    follow_count = db.query(func.count(models.Follow.id)).filter(
+        or_(
+            and_(models.Follow.follower_id == user_a_id, models.Follow.following_id == user_b_id),
+            and_(models.Follow.follower_id == user_b_id, models.Follow.following_id == user_a_id),
+        )
+    ).scalar() or 0
+    return follow_count == 2
+
+
+def _can_users_chat(db: Session, user_a_id: int, user_b_id: int) -> bool:
+    if user_a_id == user_b_id:
+        return False
+    if _is_mutual_follow(db, user_a_id, user_b_id):
+        return True
+    request_row = _chat_request_between(db, user_a_id, user_b_id)
+    return request_row is not None and request_row.status == 'accepted'
+
+
+def _chat_contact_payload(db: Session, current_user_id: int, other: models.User) -> dict:
+    is_following = db.query(models.Follow).filter(
+        models.Follow.follower_id == current_user_id,
+        models.Follow.following_id == other.id,
+    ).first() is not None
+    is_following_you = db.query(models.Follow).filter(
+        models.Follow.follower_id == other.id,
+        models.Follow.following_id == current_user_id,
+    ).first() is not None
+    is_mutual_follow = is_following and is_following_you
+
+    request_row = _chat_request_between(db, current_user_id, other.id)
+    request_status = 'none'
+    request_id: Optional[int] = None
+    if request_row and request_row.status == 'accepted':
+        request_status = 'accepted'
+    elif request_row and request_row.status == 'pending':
+        request_id = request_row.id
+        request_status = 'outgoing_pending' if request_row.requester_id == current_user_id else 'incoming_pending'
+
+    can_chat = is_mutual_follow or (request_row is not None and request_row.status == 'accepted')
+    return {
+        'id': other.id,
+        'username': other.username,
+        'avatar_url': other.profile.avatar_url if other.profile else '',
+        'is_following': is_following,
+        'is_following_you': is_following_you,
+        'is_mutual_follow': is_mutual_follow,
+        'can_chat': can_chat,
+        'request_status': request_status,
+        'request_id': request_id,
+    }
+
+
 def _cleanup_attempts(ip: str, now_ts: float):
     _login_attempts[ip] = [ts for ts in _login_attempts[ip] if now_ts - ts <= LOGIN_WINDOW_SECONDS]
 
@@ -59,6 +166,67 @@ def _throttle_login(ip: str, now_ts: float):
 def _login_fail(ip: str, now_ts: float):
     _cleanup_attempts(ip, now_ts)
     _login_attempts[ip].append(now_ts)
+
+
+def _password_reset_secret() -> str:
+    return os.getenv('PASSWORD_RESET_OTP_SECRET', os.getenv('JWT_SECRET_KEY', 'terimaa'))
+
+
+def _hash_password_reset_otp(email: str, otp: str) -> str:
+    payload = f'{email.strip().lower()}:{otp.strip()}'.encode('utf-8')
+    secret = _password_reset_secret().encode('utf-8')
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def _generate_password_reset_otp() -> str:
+    return f'{random.randint(0, 999999):06d}'
+
+
+def _send_password_reset_email(email: str, otp: str, username: str) -> None:
+    api_key = os.getenv('RESEND_API_KEY', '').strip()
+    from_email = os.getenv('RESEND_FROM_EMAIL', 'onboarding@resend.dev').strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail='Password reset email service is not configured')
+
+    subject = 'Your InkLounge password reset OTP'
+    greeting_name = (username or 'there').strip()
+    html = (
+        f'<p>Hi {greeting_name},</p>'
+        f'<p>Your OTP for resetting your InkLounge password is:</p>'
+        f'<h2 style=\"letter-spacing:3px;\">{otp}</h2>'
+        f'<p>This OTP expires in {PASSWORD_RESET_OTP_TTL_MINUTES} minutes.</p>'
+        f'<p>If you did not request this, please ignore this email.</p>'
+    )
+    text = (
+        f'Hi {greeting_name},\n\n'
+        f'Your OTP for resetting your InkLounge password is: {otp}\n'
+        f'This OTP expires in {PASSWORD_RESET_OTP_TTL_MINUTES} minutes.\n\n'
+        f'If you did not request this, please ignore this email.'
+    )
+
+    payload = {
+        'from': from_email,
+        'to': [email],
+        'subject': subject,
+        'html': html,
+        'text': text,
+    }
+    req = urllib.request.Request(
+        'https://api.resend.com/emails',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            return
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail='Unable to send OTP email right now') from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail='Unable to send OTP email right now') from exc
 
 
 def _profile(db: Session, user_id: int) -> models.UserProfile:
@@ -150,9 +318,14 @@ def _feed_items(db: Session, posts: List[models.Post], user_id: int) -> List[dic
             'id': p.id,
             'title': p.title,
             'content': p.content,
+            'image_url': p.image_url,
             'author_id': p.author_id,
             'created_at': p.created_at,
-            'author': p.author,
+            'author': {
+                'id': p.author.id,
+                'username': p.author.username,
+                'avatar_url': p.author.profile.avatar_url if p.author.profile else "",
+            },
             'like_count': like_counts.get(p.id, 0),
             'comment_count': comment_counts.get(p.id, 0),
             'is_liked': p.id in liked,
@@ -252,6 +425,85 @@ def logout(payload: schemas.RefreshTokenRequest, db: Session = Depends(database.
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.post('/password-reset/request', response_model=schemas.ActionMessageResponse)
+def request_password_reset(payload: schemas.PasswordResetRequest, db: Session = Depends(database.get_db)):
+    generic_response = {'message': 'If this email is registered, an OTP has been sent.'}
+    email = payload.email.strip().lower()
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        return generic_response
+
+    now = datetime.utcnow()
+    db.query(models.PasswordResetOTP).filter(
+        models.PasswordResetOTP.user_id == user.id,
+        models.PasswordResetOTP.used_at.is_(None),
+    ).update({'used_at': now}, synchronize_session=False)
+
+    otp = _generate_password_reset_otp()
+    row = models.PasswordResetOTP(
+        user_id=user.id,
+        email=email,
+        otp_hash=_hash_password_reset_otp(email, otp),
+        expires_at=now + timedelta(minutes=PASSWORD_RESET_OTP_TTL_MINUTES),
+        attempts=0,
+    )
+    db.add(row)
+
+    try:
+        _send_password_reset_email(email, otp, user.username)
+    except HTTPException:
+        db.rollback()
+        raise
+
+    db.commit()
+    return generic_response
+
+
+@app.post('/password-reset/confirm', response_model=schemas.ActionMessageResponse)
+def confirm_password_reset(payload: schemas.PasswordResetConfirm, db: Session = Depends(database.get_db)):
+    email = payload.email.strip().lower()
+    now = datetime.utcnow()
+    invalid_otp = HTTPException(status_code=400, detail='Invalid or expired OTP')
+
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        raise invalid_otp
+
+    row = db.query(models.PasswordResetOTP).filter(
+        models.PasswordResetOTP.user_id == user.id,
+        models.PasswordResetOTP.used_at.is_(None),
+    ).order_by(models.PasswordResetOTP.created_at.desc()).first()
+    if not row:
+        raise invalid_otp
+    if row.expires_at <= now:
+        row.used_at = now
+        db.commit()
+        raise invalid_otp
+
+    if row.attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
+        row.used_at = now
+        db.commit()
+        raise invalid_otp
+
+    provided_hash = _hash_password_reset_otp(email, payload.otp)
+    if not hmac.compare_digest(provided_hash, row.otp_hash):
+        row.attempts += 1
+        if row.attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
+            row.used_at = now
+        db.commit()
+        raise invalid_otp
+
+    user.hashed_password = utils.hash_password(payload.new_password)
+    row.used_at = now
+    db.query(models.RefreshToken).filter(
+        models.RefreshToken.user_id == user.id,
+        models.RefreshToken.revoked_at.is_(None),
+    ).update({'revoked_at': now}, synchronize_session=False)
+    db.commit()
+
+    return {'message': 'Password reset successful. Please log in with your new password.'}
+
+
 @app.get('/users/all', response_model=List[schemas.UserPublic])
 def get_all_users(db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
     return db.query(models.User).filter(models.User.id != current_user.id).all()
@@ -260,6 +512,126 @@ def get_all_users(db: Session = Depends(database.get_db), current_user: models.U
 @app.get('/users/online', response_model=schemas.OnlineUsersResponse)
 def get_online_users(current_user: models.User = Depends(oauth2.get_current_user)):
     return {'online_user_ids': manager.get_online_user_ids()}
+
+
+@app.get('/chat/contacts', response_model=List[schemas.ChatContactResponse])
+def get_chat_contacts(db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    users = db.query(models.User).options(joinedload(models.User.profile)).filter(models.User.id != current_user.id).order_by(models.User.username.asc()).all()
+    return [_chat_contact_payload(db, current_user.id, row) for row in users]
+
+
+@app.post('/chat/requests/{user_id}', response_model=schemas.ChatRequestResponse, status_code=status.HTTP_201_CREATED)
+def send_chat_request(user_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail='You cannot send a chat request to yourself')
+
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail='User not found')
+
+    if _is_mutual_follow(db, current_user.id, user_id):
+        raise HTTPException(status_code=400, detail='You can already chat because you follow each other')
+
+    existing = _chat_request_between(db, current_user.id, user_id)
+    if existing and existing.status == 'accepted':
+        raise HTTPException(status_code=400, detail='Chat is already enabled for this user')
+
+    if existing and existing.status == 'pending':
+        if existing.requester_id == current_user.id:
+            raise HTTPException(status_code=400, detail='Chat request already sent')
+        raise HTTPException(status_code=400, detail='This user already sent you a request. Please accept it from chat.')
+
+    if existing:
+        existing.requester_id = current_user.id
+        existing.target_id = user_id
+        existing.status = 'pending'
+        existing.updated_at = datetime.utcnow()
+        row = existing
+    else:
+        low, high = _pair_ids(current_user.id, user_id)
+        row = models.ChatRequest(
+            requester_id=current_user.id,
+            target_id=user_id,
+            pair_low_id=low,
+            pair_high_id=high,
+            status='pending',
+        )
+        db.add(row)
+
+    db.commit()
+    db.refresh(row)
+
+    _notify(
+        db,
+        recipient_id=user_id,
+        actor_id=current_user.id,
+        type_='chat_request',
+        entity_type='user',
+        entity_id=current_user.id,
+        message=f'{current_user.username} sent you a chat request.',
+    )
+    return row
+
+
+@app.post('/chat/requests/{request_id}/accept', response_model=schemas.ChatRequestResponse)
+def accept_chat_request(request_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    row = db.query(models.ChatRequest).filter(models.ChatRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Chat request not found')
+    if row.target_id != current_user.id:
+        raise HTTPException(status_code=403, detail='Not authorized to accept this request')
+    if row.status != 'pending':
+        raise HTTPException(status_code=400, detail='This request is no longer pending')
+
+    row.status = 'accepted'
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+
+    _notify(
+        db,
+        recipient_id=row.requester_id,
+        actor_id=current_user.id,
+        type_='chat_request_accepted',
+        entity_type='user',
+        entity_id=current_user.id,
+        message=f'{current_user.username} accepted your chat request.',
+    )
+    return row
+
+
+@app.post('/chat/requests/{request_id}/reject', response_model=schemas.ChatRequestResponse)
+def reject_chat_request(request_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    row = db.query(models.ChatRequest).filter(models.ChatRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Chat request not found')
+    if row.target_id != current_user.id:
+        raise HTTPException(status_code=403, detail='Not authorized to reject this request')
+    if row.status != 'pending':
+        raise HTTPException(status_code=400, detail='This request is no longer pending')
+
+    row.status = 'rejected'
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.delete('/chat/requests/{request_id}', response_model=schemas.ChatRequestResponse)
+def cancel_chat_request(request_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    row = db.query(models.ChatRequest).filter(models.ChatRequest.id == request_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Chat request not found')
+    if row.requester_id != current_user.id:
+        raise HTTPException(status_code=403, detail='Not authorized to cancel this request')
+    if row.status != 'pending':
+        raise HTTPException(status_code=400, detail='Only pending requests can be cancelled')
+
+    row.status = 'cancelled'
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 @app.get('/me/profile', response_model=schemas.UserProfileResponse)
@@ -400,12 +772,12 @@ def get_feed(
 
 @app.get('/posts/', response_model=List[schemas.PostResponse])
 def get_posts(db: Session = Depends(database.get_db), limit: int = 10, skip: int = 0):
-    return db.query(models.Post).order_by(models.Post.created_at.desc()).limit(limit).offset(skip).all()
+    return db.query(models.Post).options(joinedload(models.Post.author).joinedload(models.User.profile)).order_by(models.Post.created_at.desc()).limit(limit).offset(skip).all()
 
 
 @app.get('/posts/{post_id}', response_model=schemas.PostResponse)
 def get_post(post_id: int, db: Session = Depends(database.get_db)):
-    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    post = db.query(models.Post).options(joinedload(models.Post.author).joinedload(models.User.profile)).filter(models.Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail='Post not found')
     return post
@@ -417,7 +789,7 @@ def get_post_feed_view(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(oauth2.get_current_user),
 ):
-    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    post = db.query(models.Post).options(joinedload(models.Post.author).joinedload(models.User.profile)).filter(models.Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail='Post not found')
     return _feed_items(db, [post], current_user.id)[0]
@@ -430,7 +802,12 @@ def create_post(post: schemas.PostCreate, db: Session = Depends(database.get_db)
     if not title or not content:
         raise HTTPException(status_code=400, detail='Title and content are required')
 
-    row = models.Post(title=title, content=content, author_id=current_user.id)
+    row = models.Post(
+        title=title,
+        content=content,
+        image_url=(post.image_url or "").strip(),
+        author_id=current_user.id,
+    )
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -446,8 +823,10 @@ def update_post(post_id: int, updated_post: schemas.PostCreate, db: Session = De
     if post.author_id != current_user.id:
         raise HTTPException(status_code=403, detail='Not authorized')
 
+    next_image_url = post.image_url if updated_post.image_url is None else updated_post.image_url.strip()
+
     query.update(
-        {'title': updated_post.title.strip(), 'content': updated_post.content.strip()},
+        {'title': updated_post.title.strip(), 'content': updated_post.content.strip(), 'image_url': next_image_url},
         synchronize_session=False,
     )
     db.commit()
@@ -466,6 +845,18 @@ def delete_post(post_id: int, db: Session = Depends(database.get_db), current_us
     query.delete(synchronize_session=False)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.put('/users/profile/avatar')
+async def update_avatar(file: UploadFile = File(...), db: Session = Depends(database.get_db), current_user: models.User = Depends(oauth2.get_current_user)):
+    result = cloudinary.uploader.upload(file.file)
+    profile = db.query(models.UserProfile).filter(models.UserProfile.user_id == current_user.id).first()
+    if not profile:
+        profile = models.UserProfile(user_id=current_user.id)
+        db.add(profile)
+    profile.avatar_url = result['secure_url']
+    db.commit()
+    return {"avatar_url": result['secure_url']}
 
 
 @app.post('/posts/{post_id}/bookmark', response_model=schemas.BookmarkStatusResponse)
@@ -906,6 +1297,8 @@ def get_messages(
     other = db.query(models.User).filter(models.User.id == other_user_id).first()
     if not other:
         raise HTTPException(status_code=404, detail='User not found')
+    if not _can_users_chat(db, current_user.id, other_user_id):
+        raise HTTPException(status_code=403, detail='You can only chat with mutual follows or accepted requests')
 
     rows = db.query(models.Message).filter(
         or_(
@@ -929,6 +1322,8 @@ async def create_message(
     receiver = db.query(models.User).filter(models.User.id == payload.receiver_id).first()
     if not receiver:
         raise HTTPException(status_code=404, detail='Receiver not found')
+    if not _can_users_chat(db, current_user.id, payload.receiver_id):
+        raise HTTPException(status_code=403, detail='You can only chat with mutual follows or accepted requests')
 
     text = payload.content.strip()
     if not text:
@@ -963,6 +1358,9 @@ async def mark_conversation_read(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(oauth2.get_current_user),
 ):
+    if not _can_users_chat(db, current_user.id, other_user_id):
+        raise HTTPException(status_code=403, detail='You can only chat with mutual follows or accepted requests')
+
     incoming = db.query(models.Message).filter(
         models.Message.sender_id == other_user_id,
         models.Message.receiver_id == current_user.id,
@@ -1015,6 +1413,13 @@ async def websocket_chat(websocket: WebSocket, user_id: int):
             if event_type == 'typing':
                 receiver_id = int(data.get('receiver_id', 0))
                 if receiver_id > 0:
+                    db = database.SessionLocal()
+                    try:
+                        can_chat = _can_users_chat(db, user_id, receiver_id)
+                    finally:
+                        db.close()
+                    if not can_chat:
+                        continue
                     await manager.send_personal_message(
                         {
                             'type': 'typing',
@@ -1029,6 +1434,13 @@ async def websocket_chat(websocket: WebSocket, user_id: int):
             if event_type == 'read':
                 receiver_id = int(data.get('receiver_id', 0))
                 if receiver_id > 0:
+                    db = database.SessionLocal()
+                    try:
+                        can_chat = _can_users_chat(db, user_id, receiver_id)
+                    finally:
+                        db.close()
+                    if not can_chat:
+                        continue
                     await manager.send_personal_message(
                         {
                             'type': 'read',

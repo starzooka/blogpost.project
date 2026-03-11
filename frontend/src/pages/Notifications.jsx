@@ -23,6 +23,9 @@ function notificationLink(item, commentPostMap) {
   }
 
   if (item.entity_type === 'user') {
+    if ((item.type === 'chat_request' || item.type === 'chat_request_accepted') && item.actor_id) {
+      return `/chat?user=${item.actor_id}`;
+    }
     return '/profile';
   }
 

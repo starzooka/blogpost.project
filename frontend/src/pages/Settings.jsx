@@ -8,6 +8,8 @@ function Settings() {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [avatarFile, setAvatarFile] = useState(null);
+  const [avatarStatus, setAvatarStatus] = useState('');
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -38,6 +40,26 @@ function Settings() {
       setStatus('Settings saved.');
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to save settings.');
+    }
+  };
+
+  const handleFileChange = (event) => {
+    setAvatarFile(event.target.files[0]);
+  };
+
+  const handleAvatarUpload = async (event) => {
+    event.preventDefault();
+    if (!avatarFile) return;
+    setAvatarStatus('');
+    const formData = new FormData();
+    formData.append('file', avatarFile);
+    try {
+      await api.put('/users/profile/avatar', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setAvatarStatus('Avatar updated!');
+    } catch {
+      setAvatarStatus('Failed to upload avatar.');
     }
   };
 
@@ -87,6 +109,15 @@ function Settings() {
 
         {status && <p className="save-success">{status}</p>}
         {error && <div className="form-error">{error}</div>}
+      </article>
+
+      <article className="card account-main">
+        <h2>Profile Picture</h2>
+        <form className="form-stack" onSubmit={handleAvatarUpload}>
+          <input type="file" accept="image/*" onChange={handleFileChange} />
+          <button type="submit" className="btn btn-primary">Upload Avatar</button>
+        </form>
+        {avatarStatus && <p>{avatarStatus}</p>}
       </article>
     </section>
   );

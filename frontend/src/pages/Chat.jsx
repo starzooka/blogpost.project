@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import api, { WS_BASE_URL } from '../api';
 
 const RECONNECT_DELAY_MS = 2500;
 const HISTORY_POLL_MS = 8000;
 const ONLINE_POLL_MS = 10000;
+const CONTACTS_POLL_MS = 15000;
 const TYPING_STOP_DELAY_MS = 1200;
 
 function Chat() {
@@ -17,6 +18,7 @@ function Chat() {
   const [socketState, setSocketState] = useState('connecting');
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
+  const [requestBusy, setRequestBusy] = useState(false);
   const [typingByUserId, setTypingByUserId] = useState(null);
   const [readReceiptText, setReadReceiptText] = useState('');
 
@@ -28,23 +30,36 @@ function Chat() {
   const token = localStorage.getItem('access_token');
   const myId = Number(localStorage.getItem('user_id') || 0);
   const requestedUserId = Number(searchParams.get('user') || 0);
+  const canChatWithSelected = Boolean(selectedUser?.can_chat);
+
+  const refreshContacts = useCallback(async () => {
+    if (!token) return;
+    try {
+      const response = await api.get('/chat/contacts');
+      setUsers(response.data);
+    } catch {
+      setError('Unable to load contacts. Please refresh.');
+    }
+  }, [token]);
 
   useEffect(() => {
     selectedUserRef.current = selectedUser;
   }, [selectedUser]);
 
   useEffect(() => {
-    if (!token) return;
-    const fetchUsers = async () => {
-      try {
-        const response = await api.get('/users/all');
-        setUsers(response.data);
-      } catch {
-        setError('Unable to load contacts. Please refresh.');
-      }
-    };
-    fetchUsers();
-  }, [token]);
+    if (!token) return undefined;
+    refreshContacts();
+    const intervalId = setInterval(refreshContacts, CONTACTS_POLL_MS);
+    return () => clearInterval(intervalId);
+  }, [token, refreshContacts]);
+
+  useEffect(() => {
+    setSelectedUser((prev) => {
+      if (!prev) return prev;
+      const updated = users.find((user) => user.id === prev.id);
+      return updated || prev;
+    });
+  }, [users]);
 
   useEffect(() => {
     if (!requestedUserId || users.length === 0) return;
@@ -78,14 +93,14 @@ function Chat() {
           const active = selectedUserRef.current;
 
           if (data.type === 'typing') {
-            if (active && data.sender_id === active.id && data.receiver_id === myId) {
+            if (active && active.can_chat && data.sender_id === active.id && data.receiver_id === myId) {
               setTypingByUserId(data.is_typing ? data.sender_id : null);
             }
             return;
           }
 
           if (data.type === 'read') {
-            if (active && data.sender_id === active.id && data.receiver_id === myId) {
+            if (active && active.can_chat && data.sender_id === active.id && data.receiver_id === myId) {
               setMessages((prev) => prev.map((msg) => (
                 msg.sender_id === myId && msg.receiver_id === active.id ? { ...msg, is_read: true } : msg
               )));
@@ -165,6 +180,12 @@ function Chat() {
       setReadReceiptText('');
       return undefined;
     }
+    if (!selectedUser.can_chat) {
+      setMessages([]);
+      setTypingByUserId(null);
+      setReadReceiptText('');
+      return undefined;
+    }
 
     let mounted = true;
     const fetchHistory = async () => {
@@ -186,7 +207,7 @@ function Chat() {
       mounted = false;
       clearInterval(intervalId);
     };
-  }, [selectedUser]);
+  }, [selectedUser, selectedUser?.can_chat]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -199,7 +220,7 @@ function Chat() {
   }, []);
 
   useEffect(() => {
-    if (!selectedUser) return;
+    if (!selectedUser || !selectedUser.can_chat) return;
     const unreadIncoming = messages.some(
       (msg) => msg.sender_id === selectedUser.id && msg.receiver_id === myId && !msg.is_read
     );
@@ -220,7 +241,7 @@ function Chat() {
   }, [messages, myId, selectedUser]);
 
   const sendTypingSignal = (isTyping) => {
-    if (!selectedUser) return;
+    if (!selectedUser || !selectedUser.can_chat) return;
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
     socketRef.current.send(JSON.stringify({
       type: 'typing',
@@ -245,6 +266,10 @@ function Chat() {
     event.preventDefault();
     const cleanMessage = inputMessage.trim();
     if (!cleanMessage || !selectedUser || sending) return;
+    if (!selectedUser.can_chat) {
+      setError('You can only chat with mutual follows or accepted requests.');
+      return;
+    }
 
     setSending(true);
     setError('');
@@ -269,6 +294,7 @@ function Chat() {
 
   const visibleMessages = useMemo(() => {
     if (!selectedUser) return [];
+    if (!selectedUser.can_chat) return [];
     return messages
       .filter((msg) => (
         (msg.sender_id === selectedUser.id && msg.receiver_id === myId) ||
@@ -276,6 +302,47 @@ function Chat() {
       ))
       .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   }, [messages, myId, selectedUser]);
+
+  const contactAccessLabel = (user) => {
+    if (user.can_chat && user.is_mutual_follow) return 'mutual follow';
+    if (user.can_chat) return 'chat allowed';
+    if (user.request_status === 'incoming_pending') return 'request received';
+    if (user.request_status === 'outgoing_pending') return 'request sent';
+    return 'request needed';
+  };
+
+  const runRequestAction = async (action) => {
+    setRequestBusy(true);
+    setError('');
+    try {
+      await action();
+      await refreshContacts();
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Failed to update chat request.');
+    } finally {
+      setRequestBusy(false);
+    }
+  };
+
+  const sendChatRequest = async () => {
+    if (!selectedUser) return;
+    await runRequestAction(() => api.post(`/chat/requests/${selectedUser.id}`));
+  };
+
+  const acceptChatRequest = async () => {
+    if (!selectedUser?.request_id) return;
+    await runRequestAction(() => api.post(`/chat/requests/${selectedUser.request_id}/accept`));
+  };
+
+  const rejectChatRequest = async () => {
+    if (!selectedUser?.request_id) return;
+    await runRequestAction(() => api.post(`/chat/requests/${selectedUser.request_id}/reject`));
+  };
+
+  const cancelChatRequest = async () => {
+    if (!selectedUser?.request_id) return;
+    await runRequestAction(() => api.delete(`/chat/requests/${selectedUser.request_id}`));
+  };
 
   const connectionLabel = {
     connected: 'Live',
@@ -322,8 +389,13 @@ function Chat() {
                   <span className="contact-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
                   <span className="contact-meta">
                     <span>{user.username}</span>
-                    <span className={`contact-presence ${online ? 'is-online' : ''}`}>
-                      {online ? 'online' : 'offline'}
+                    <span className="contact-presence-row">
+                      <span className={`contact-presence ${online ? 'is-online' : ''}`}>
+                        {online ? 'online' : 'offline'}
+                      </span>
+                      <span className={`contact-access-tag ${user.can_chat ? 'is-open' : ''}`}>
+                        {contactAccessLabel(user)}
+                      </span>
                     </span>
                   </span>
                 </button>
@@ -337,43 +409,74 @@ function Chat() {
             <>
               <header className="chat-head">
                 <h4>{selectedUser.username}</h4>
-                {typingByUserId === selectedUser.id && <span className="typing-indicator">typing...</span>}
+                {canChatWithSelected && typingByUserId === selectedUser.id && <span className="typing-indicator">typing...</span>}
               </header>
 
-              <div className="chat-feed">
-                {visibleMessages.length === 0 ? (
-                  <p className="status-text">No messages yet. Start the conversation.</p>
-                ) : (
-                  visibleMessages.map((msg) => (
-                    <article
-                      key={msg.id || `${msg.sender_id}-${msg.created_at}`}
-                      className={`message-bubble ${msg.sender_id === myId ? 'mine' : 'theirs'}`}
-                    >
-                      <p>{msg.content}</p>
-                      <time>
-                        {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </time>
-                    </article>
-                  ))
-                )}
-                <div ref={messagesEndRef} />
-              </div>
+              {!canChatWithSelected ? (
+                <div className="chat-access-gate">
+                  <h5>Chat locked</h5>
+                  <p>You can message this user only after a mutual follow or an accepted chat request.</p>
+                  <div className="inline-actions">
+                    {selectedUser.request_status === 'none' && (
+                      <button type="button" className="btn btn-primary" onClick={sendChatRequest} disabled={requestBusy}>
+                        {requestBusy ? 'Sending...' : 'Send chat request'}
+                      </button>
+                    )}
+                    {selectedUser.request_status === 'incoming_pending' && (
+                      <>
+                        <button type="button" className="btn btn-primary" onClick={acceptChatRequest} disabled={requestBusy}>
+                          {requestBusy ? 'Updating...' : 'Accept request'}
+                        </button>
+                        <button type="button" className="btn btn-muted" onClick={rejectChatRequest} disabled={requestBusy}>
+                          Reject
+                        </button>
+                      </>
+                    )}
+                    {selectedUser.request_status === 'outgoing_pending' && (
+                      <button type="button" className="btn btn-muted" onClick={cancelChatRequest} disabled={requestBusy}>
+                        {requestBusy ? 'Updating...' : 'Cancel request'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="chat-feed">
+                    {visibleMessages.length === 0 ? (
+                      <p className="status-text">No messages yet. Start the conversation.</p>
+                    ) : (
+                      visibleMessages.map((msg) => (
+                        <article
+                          key={msg.id || `${msg.sender_id}-${msg.created_at}`}
+                          className={`message-bubble ${msg.sender_id === myId ? 'mine' : 'theirs'}`}
+                        >
+                          <p>{msg.content}</p>
+                          <time>
+                            {new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </time>
+                        </article>
+                      ))
+                    )}
+                    <div ref={messagesEndRef} />
+                  </div>
 
-              <footer className="chat-foot-meta">
-                <span>{readReceiptText}</span>
-              </footer>
+                  <footer className="chat-foot-meta">
+                    <span>{readReceiptText}</span>
+                  </footer>
 
-              <form onSubmit={sendMessage} className="chat-compose">
-                <input
-                  type="text"
-                  value={inputMessage}
-                  onChange={handleMessageInput}
-                  placeholder="Write a message"
-                />
-                <button type="submit" className="btn btn-accent" disabled={sending}>
-                  {sending ? 'Sending...' : 'Send'}
-                </button>
-              </form>
+                  <form onSubmit={sendMessage} className="chat-compose">
+                    <input
+                      type="text"
+                      value={inputMessage}
+                      onChange={handleMessageInput}
+                      placeholder="Write a message"
+                    />
+                    <button type="submit" className="btn btn-accent" disabled={sending}>
+                      {sending ? 'Sending...' : 'Send'}
+                    </button>
+                  </form>
+                </>
+              )}
 
               {error && <div className="form-error chat-error">{error}</div>}
             </>

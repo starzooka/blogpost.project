@@ -96,8 +96,7 @@ function Moderation() {
                   <strong>#{report.id} {report.target_type}:{report.target_id}</strong>
                   <p>{report.reason}</p>
                   <small>
-                    Reporter {report.reporter_id} • Status: {report.status} •
-                    {' '}Created {new Date(report.created_at).toLocaleString()}
+                    Reporter {report.reporter_id} | Status: {report.status} | Created {new Date(report.created_at).toLocaleString()}
                   </small>
                   {report.admin_note && <p className="report-note">Admin note: {report.admin_note}</p>}
                 </div>
@@ -125,3 +124,4 @@ function Moderation() {
 }
 
 export default Moderation;
+

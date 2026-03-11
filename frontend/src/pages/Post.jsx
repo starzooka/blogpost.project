@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import api from '../api';
+import ImageLightbox from '../components/ImageLightbox';
 
 function Post() {
   const { id } = useParams();
@@ -19,6 +20,8 @@ function Post() {
   const [editPostContent, setEditPostContent] = useState('');
   const [editingCommentId, setEditingCommentId] = useState(null);
   const [editCommentContent, setEditCommentContent] = useState('');
+  const [fullscreenImage, setFullscreenImage] = useState('');
+  const [authorMenuOpen, setAuthorMenuOpen] = useState(false);
 
   const currentUserId = Number(localStorage.getItem('user_id') || 0);
   const isOwnPost = post?.author_id === currentUserId;
@@ -55,6 +58,17 @@ function Post() {
     fetchPostAndComments();
   }, [fetchPostAndComments]);
 
+  useEffect(() => {
+    const handleDocumentClick = (event) => {
+      if (!(event.target instanceof Element) || !event.target.closest('.author-menu')) {
+        setAuthorMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('click', handleDocumentClick);
+    return () => document.removeEventListener('click', handleDocumentClick);
+  }, []);
+
   const handleUpdatePost = async () => {
     const cleanTitle = editPostTitle.trim();
     const cleanContent = editPostContent.trim();
@@ -64,7 +78,11 @@ function Post() {
     }
     setFormError('');
     try {
-      await api.put(`/posts/${postId}`, { title: cleanTitle, content: cleanContent });
+      await api.put(`/posts/${postId}`, {
+        title: cleanTitle,
+        content: cleanContent,
+        image_url: post?.image_url || '',
+      });
       setIsEditingPost(false);
       await fetchPostAndComments();
     } catch (err) {
@@ -234,10 +252,41 @@ function Post() {
             <>
               <h1 className="post-detail-title">{post.title}</h1>
               <p className="post-detail-content">{post.content}</p>
+              {post.image_url && (
+                <button
+                  type="button"
+                  className="post-image-button"
+                  onClick={() => setFullscreenImage(post.image_url)}
+                  aria-label="Open image in full screen"
+                >
+                  <img src={post.image_url} alt="Post image" className="post-image" />
+                </button>
+              )}
 
               <div className="post-detail-footer">
                 <div className="post-detail-meta">
-                  Posted by <span>{post.author?.username}</span> on {new Date(post.created_at).toLocaleDateString()}
+                  Posted by {post.author?.avatar_url && <img src={post.author.avatar_url} alt="avatar" className="avatar" />}
+                  <span className="author-menu">
+                    <button
+                      type="button"
+                      className="author-name-button"
+                      onClick={() => setAuthorMenuOpen((prev) => !prev)}
+                    >
+                      {post.author?.username}
+                    </button>
+                    {authorMenuOpen && (
+                      <div className="author-dropdown">
+                        {post.author_id !== currentUserId ? (
+                          <Link to={`/chat?user=${post.author_id}`} className="author-dropdown-link" onClick={() => setAuthorMenuOpen(false)}>
+                            Chat with author
+                          </Link>
+                        ) : (
+                          <small className="author-dropdown-note">This is your post</small>
+                        )}
+                      </div>
+                    )}
+                  </span>
+                  {' '}on {new Date(post.created_at).toLocaleDateString()}
                 </div>
 
                 <div className="inline-actions">
@@ -351,6 +400,8 @@ function Post() {
           </div>
         </section>
       </div>
+
+      <ImageLightbox imageUrl={fullscreenImage} onClose={() => setFullscreenImage('')} />
     </section>
   );
 }

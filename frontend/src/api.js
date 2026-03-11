@@ -6,11 +6,62 @@ const LOGIN_PATH = '/login';
 const REFRESH_PATH = '/refresh';
 const REFRESH_TOKEN_KEY = 'refresh_token';
 const ACCESS_TOKEN_KEY = 'access_token';
+const AVATAR_URL_KEY = 'avatar_url';
 
 // Create an Axios instance pointing to your FastAPI backend URL
 const api = axios.create({
     baseURL: API_BASE_URL,
 });
+
+const CANDIDATE_API_BASE_URLS = Array.from(new Set([
+    API_BASE_URL,
+    'http://127.0.0.1:8080',
+    'http://localhost:8080',
+    'http://127.0.0.1:8000',
+    'http://localhost:8000',
+    'http://127.0.0.1:8003',
+    'http://localhost:8003',
+]));
+
+let baseUrlProbePromise = null;
+
+const probeApiBaseUrl = async (baseUrl) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1200);
+    try {
+        const response = await fetch(`${baseUrl}/`, {
+            method: 'GET',
+            signal: controller.signal,
+            credentials: 'omit',
+        });
+        return response.ok;
+    } catch {
+        return false;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+};
+
+const resolveApiBaseUrl = async () => {
+    if (baseUrlProbePromise) {
+        return baseUrlProbePromise;
+    }
+
+    baseUrlProbePromise = (async () => {
+        for (const baseUrl of CANDIDATE_API_BASE_URLS) {
+            const isReachable = await probeApiBaseUrl(baseUrl);
+            if (isReachable) {
+                api.defaults.baseURL = baseUrl;
+                return baseUrl;
+            }
+        }
+        return null;
+    })().finally(() => {
+        baseUrlProbePromise = null;
+    });
+
+    return baseUrlProbePromise;
+};
 
 // Add an interceptor to automatically attach the JWT token to requests
 api.interceptors.request.use(
@@ -35,9 +86,10 @@ const getSessionSnapshot = () => ({
     refreshToken: localStorage.getItem(REFRESH_TOKEN_KEY),
     username: localStorage.getItem('username'),
     userId: Number(localStorage.getItem('user_id') || 0),
+    avatarUrl: localStorage.getItem(AVATAR_URL_KEY) || '',
 });
 
-export const setSessionData = ({ accessToken, refreshToken, username, userId }) => {
+export const setSessionData = ({ accessToken, refreshToken, username, userId, avatarUrl }) => {
     if (accessToken) {
         localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
     }
@@ -50,6 +102,13 @@ export const setSessionData = ({ accessToken, refreshToken, username, userId }) 
     if (userId) {
         localStorage.setItem('user_id', String(userId));
     }
+    if (avatarUrl !== undefined) {
+        if (avatarUrl) {
+            localStorage.setItem(AVATAR_URL_KEY, avatarUrl);
+        } else {
+            localStorage.removeItem(AVATAR_URL_KEY);
+        }
+    }
 };
 
 export const clearSessionData = () => {
@@ -57,6 +116,7 @@ export const clearSessionData = () => {
     localStorage.removeItem(REFRESH_TOKEN_KEY);
     localStorage.removeItem('username');
     localStorage.removeItem('user_id');
+    localStorage.removeItem(AVATAR_URL_KEY);
 };
 
 export const isAdminUser = (userId, username) => Number(userId) === 1 || String(username || '').toLowerCase() === 'admin';
@@ -89,6 +149,19 @@ api.interceptors.response.use(
     async (error) => {
         const originalRequest = error.config || {};
         const statusCode = error.response?.status;
+        const shouldRetryWithBaseUrlSwitch =
+            !error.response &&
+            !originalRequest._retryBaseUrl &&
+            !originalRequest.skipBaseUrlRetry;
+
+        if (shouldRetryWithBaseUrlSwitch) {
+            originalRequest._retryBaseUrl = true;
+            const nextBaseUrl = await resolveApiBaseUrl();
+            if (nextBaseUrl) {
+                originalRequest.baseURL = nextBaseUrl;
+                return api(originalRequest);
+            }
+        }
 
         if (
             statusCode !== 401 ||

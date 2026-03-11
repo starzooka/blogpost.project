@@ -2,6 +2,7 @@ import jwt
 import os
 import hashlib
 import secrets
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -9,7 +10,8 @@ from sqlalchemy.orm import Session
 from Backend import database,models
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "terimaa")
 ALGORITHM = "HS256"

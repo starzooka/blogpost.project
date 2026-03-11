@@ -22,6 +22,7 @@ class UserResponse(UserBase):
 class UserPublic(BaseModel):
     id: int
     username: str
+    avatar_url: Optional[str] = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -59,6 +60,7 @@ class UserSettingResponse(BaseModel):
 class PostBase(BaseModel):
     title: str
     content: str
+    image_url: Optional[str] = None
 
 
 class PostCreate(PostBase):
@@ -210,3 +212,37 @@ class ModerationSummary(BaseModel):
     open_reports: int
     in_review_reports: int
     resolved_reports: int
+
+
+class ChatRequestResponse(BaseModel):
+    id: int
+    requester_id: int
+    target_id: int
+    status: Literal["pending", "accepted", "rejected", "cancelled"]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChatContactResponse(UserPublic):
+    is_following: bool
+    is_following_you: bool
+    is_mutual_follow: bool
+    can_chat: bool
+    request_status: Literal["none", "incoming_pending", "outgoing_pending", "accepted"] = "none"
+    request_id: Optional[int] = None
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=4, max_length=8, pattern=r"^\d{4,8}$")
+    new_password: str = Field(min_length=6, max_length=72)
+
+
+class ActionMessageResponse(BaseModel):
+    message: str
